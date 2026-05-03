@@ -1,0 +1,39 @@
+included:
+  - DataMatrixScanner
+  - DataMatrixScannerTests
+
+excluded:
+  - .build
+  - DerivedData
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - implicit_return
+  - last_where
+  - prefer_self_type_over_type_of_self
+  - redundant_nil_coalescing
+  - sorted_first_last
+  - toggle_bool
+
+analyzer_rules:
+  - unused_import
+
+disabled_rules:
+  - todo
+  - trailing_comma
+
+line_length:
+  warning: 140
+  error: 200
+
+identifier_name:
+  min_length: 2
+  excluded:
+    - id
+
+force_cast: error
+force_try: error
+force_unwrapping: error
