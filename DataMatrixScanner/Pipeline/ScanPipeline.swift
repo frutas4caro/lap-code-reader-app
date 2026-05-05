@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import UIKit
 
@@ -6,90 +7,77 @@ import UIKit
 /// an `AsyncStream` so the UI can render the grid (`.partial`) before the
 /// annotated image bake completes.
 ///
-/// This file is the **scaffold** for the pipeline. Downstream services
-/// will plug in at the `// TODO:` points below as separate beads land.
-/// The current implementation emits the ordered stage / partial /
-/// complete event sequence with an empty-but-well-formed `ScanResult`,
-/// so views and tests can integrate against the streaming contract
-/// today.
+/// v1.0 wiring:
+/// - `ImageQualityAnalyzer` is intentionally skipped; `analyzingQuality`
+///   stage is emitted for telemetry only and an empty-but-valid
+///   `ScanQualityReport` is produced. Real warning assembly lands with
+///   `dms-uff`.
+/// - `StorageManager` is intentionally skipped (no persistence in v1.0);
+///   `saving` stage is emitted as a no-op label.
 ///
-/// Sendability note: `UIImage` is not `Sendable`. The scaffold wraps the
-/// input image in a local `@unchecked Sendable` envelope (`ImageBox`)
-/// to cross the actor boundary. Bead **dms-5c3.4** (BarcodeScanner)
-/// will refactor the public API to accept a `CGImage`, which IS
-/// `Sendable`, and this envelope will go away.
+/// Sendability: the public API takes a `CGImage` (which IS `Sendable`),
+/// so no `@unchecked Sendable` wrapper is required to cross the actor
+/// boundary. The source `UIImage` consumed by the rest of the pipeline
+/// is reconstructed via `UIImage(cgImage:)` inside the actor.
 public actor ScanPipeline {
-    /// Creates a new pipeline. Stateless today; will gain injected
-    /// services as downstream beads (dms-5c3.4, dms-uff.2, dms-uff.3,
-    /// dms-d6u.1, dms-1ni.1, dms-1ni.5) land.
-    public init() {}
 
-    /// Runs the pipeline against `image` and emits an ordered stream of
+    private let scanner: BarcodeScanner
+    private let inferencer: GridInferencer
+    private let annotator: ImageAnnotator
+    private let csvExporter: CSVExporter
+
+    /// Creates a new pipeline. Service dependencies default to standard
+    /// implementations; callers may inject alternatives for testing. This
+    /// is the seam where future fakes/spies will land — see dms-ay9.
+    public init(
+        scanner: BarcodeScanner = BarcodeScanner(),
+        inferencer: GridInferencer = GridInferencer(),
+        annotator: ImageAnnotator = ImageAnnotator(),
+        csvExporter: CSVExporter = CSVExporter()
+    ) {
+        self.scanner = scanner
+        self.inferencer = inferencer
+        self.annotator = annotator
+        self.csvExporter = csvExporter
+    }
+
+    /// Runs the pipeline against `cgImage` and emits an ordered stream of
     /// `PipelineEvent`s. The stream finishes after `.complete` (success)
     /// or `.failed` (terminal error). On the happy path it never emits
     /// `.failed` — even zero detections produce a valid `ScanResult`.
     ///
     /// - Parameters:
-    ///   - image: Source photo. Captured into a `Sendable` envelope for
-    ///     actor crossing; see file-level note about dms-5c3.4.
+    ///   - cgImage: Source image. `CGImage` is `Sendable`, so it crosses
+    ///     the actor boundary cleanly.
     ///   - layout: `.auto` or `.fixed(rows, cols)`. In `.fixed` mode the
-    ///     scaffold emits `rows * cols` `.empty` cells so the UI has a
-    ///     stable grid shape to render against.
+    ///     inferencer always returns `rows × cols` cells.
     ///   - validatorPattern: Regex captured into the emitted
-    ///     `ScanResult.validatorRegex` for audit recovery.
+    ///     `ScanResult.validatorRegex` for audit recovery, and used to
+    ///     instantiate the per-run `PayloadValidator`.
     /// - Returns: An `AsyncStream<PipelineEvent>` consumable from any
     ///   isolation, including `@MainActor`.
     public func run(
-        image: UIImage,
+        cgImage: CGImage,
         layout: BoxLayout,
         validatorPattern: String
     ) -> AsyncStream<PipelineEvent> {
-        let imageBox = ImageBox(image: image)
+        let scanner = self.scanner
+        let inferencer = self.inferencer
+        let annotator = self.annotator
+        let csvExporter = self.csvExporter
+
         return AsyncStream { continuation in
             let task = Task {
-                // TODO(dms-5c3.4): replace with real ImageQualityAnalyzer.
-                continuation.yield(.stage(.analyzingQuality))
-
-                // TODO(dms-5c3.4): BarcodeScanner (Vision + ZXing) yields
-                // `[RawObservation]` here.
-                continuation.yield(.stage(.decoding))
-
-                // TODO(dms-5c3.4 / PayloadValidator): partition decoded
-                // vs. validator-rejected observations using
-                // `validatorPattern`.
-                continuation.yield(.stage(.validating))
-
-                // TODO(dms-uff.2 / dms-uff.3): GridInferencer.infer(...)
-                // produces `[GridCell]` and `[UnplacedDetection]`.
-                continuation.yield(.stage(.inferringGrid))
-
-                let cells = Self.scaffoldCells(for: layout)
-                let quality = Self.scaffoldQuality(for: layout)
-                let partial = ScanResult(
-                    sourceImage: imageBox.image,
-                    annotatedImage: nil,
-                    cells: cells,
-                    unplaced: [],
-                    csv: "",
-                    layoutMode: layout,
-                    validatorRegex: validatorPattern,
-                    quality: quality
+                await Self.execute(
+                    cgImage: cgImage,
+                    layout: layout,
+                    validatorPattern: validatorPattern,
+                    scanner: scanner,
+                    inferencer: inferencer,
+                    annotator: annotator,
+                    csvExporter: csvExporter,
+                    continuation: continuation
                 )
-                continuation.yield(.partial(partial))
-
-                // TODO(dms-d6u.1): ImageAnnotator renders the annotated
-                // UIImage and yields `.annotated(_)` here.
-                continuation.yield(.stage(.annotating))
-
-                // TODO(dms-1ni.1): CSVExporter computes the CSV string.
-                continuation.yield(.stage(.exporting))
-
-                // TODO(dms-1ni.5): StorageManager persists `StoredScan`
-                // and writes photo files under Application Support.
-                continuation.yield(.stage(.saving))
-
-                continuation.yield(.complete(partial))
-                continuation.finish()
             }
             continuation.onTermination = { _ in
                 task.cancel()
@@ -97,28 +85,135 @@ public actor ScanPipeline {
         }
     }
 
-    // MARK: - Scaffold helpers
+    // swiftlint:disable function_parameter_count function_body_length
+    /// Internal pipeline body. Extracted from `run(...)` so the public
+    /// entry point stays under the lint body-length budget.
+    private static func execute(
+        cgImage: CGImage,
+        layout: BoxLayout,
+        validatorPattern: String,
+        scanner: BarcodeScanner,
+        inferencer: GridInferencer,
+        annotator: ImageAnnotator,
+        csvExporter: CSVExporter,
+        continuation: AsyncStream<PipelineEvent>.Continuation
+    ) async {
+        // TODO(dms-uff: ImageQualityAnalyzer) — emit stage label only;
+        // quality analysis is deferred to v1.0.x.
+        continuation.yield(.stage(.analyzingQuality))
 
-    /// Builds the scaffold cell list. `.auto` returns `[]`; `.fixed`
-    /// returns a fully-empty `rows * cols` grid in row-major order.
-    private static func scaffoldCells(for layout: BoxLayout) -> [GridCell] {
-        switch layout {
-        case .auto:
-            return []
-        case let .fixed(rows, cols):
-            var cells: [GridCell] = []
-            cells.reserveCapacity(rows * cols)
-            for row in 1...rows {
-                for col in 1...cols {
-                    cells.append(GridCell(row: row, col: col, status: .empty))
-                }
+        // Decode.
+        continuation.yield(.stage(.decoding))
+        let detections: [DetectedCode]
+        do {
+            detections = try await scanner.scan(cgImage: cgImage)
+        } catch let error as ScanError {
+            continuation.yield(.failed(error))
+            continuation.finish()
+            return
+        } catch {
+            continuation.yield(.failed(.decodeFailed(underlying: error)))
+            continuation.finish()
+            return
+        }
+
+        // Validate. Feed *all* detections (accepted + rejected) into
+        // GridInferencer so spatial placement uses the full point
+        // cloud, then post-process to demote rejected cells into
+        // `.unreadable(.validatorRejected(...))`. This avoids
+        // expanding the inferencer's API in v1.0.
+        continuation.yield(.stage(.validating))
+        let validator = PayloadValidator(pattern: validatorPattern)
+        let rejectedPayloads: Set<String> = Set(
+            detections
+                .filter { !validator.matches($0.payload) }
+                .map { $0.payload }
+        )
+
+        // Infer grid.
+        continuation.yield(.stage(.inferringGrid))
+        let inference = inferencer.infer(codes: detections, layout: layout)
+        let placedCells = applyValidatorRejection(
+            cells: inference.cells,
+            rejectedPayloads: rejectedPayloads
+        )
+
+        // Build partial ScanResult.
+        let sourceImage = UIImage(cgImage: cgImage)
+        let csv = csvExporter.export(cells: placedCells)
+        let quality = buildQualityReport(
+            cells: placedCells,
+            rejectedCount: rejectedPayloads.count,
+            outlierCount: inference.unplaced.count,
+            layout: layout
+        )
+        var scanResult = ScanResult(
+            sourceImage: sourceImage,
+            annotatedImage: nil,
+            cells: placedCells,
+            unplaced: inference.unplaced,
+            csv: csv,
+            layoutMode: layout,
+            validatorRegex: validatorPattern,
+            quality: quality
+        )
+        continuation.yield(.partial(scanResult))
+
+        // Annotate.
+        continuation.yield(.stage(.annotating))
+        let annotated = annotator.annotate(image: sourceImage, cells: placedCells)
+        continuation.yield(.annotated(annotated))
+        scanResult.annotatedImage = annotated
+
+        // Export — CSV is already on `scanResult`. Stage label emitted
+        // for telemetry symmetry.
+        continuation.yield(.stage(.exporting))
+
+        // TODO(dms-1ni.5: StorageManager) — no persistence in v1.0.
+        continuation.yield(.stage(.saving))
+
+        continuation.yield(.complete(scanResult))
+        continuation.finish()
+    }
+    // swiftlint:enable function_parameter_count function_body_length
+
+    // MARK: - Helpers
+
+    /// For each `.decoded` cell whose payload is in `rejectedPayloads`,
+    /// rewrites the cell into `.unreadable(.validatorRejected(...))`,
+    /// preserving the cell's `(row, col)` placement. Cells the inferencer
+    /// already marked `.unreadable` or `.empty` are passed through.
+    private static func applyValidatorRejection(
+        cells: [GridCell],
+        rejectedPayloads: Set<String>
+    ) -> [GridCell] {
+        guard !rejectedPayloads.isEmpty else { return cells }
+        return cells.map { cell in
+            guard case let .decoded(code) = cell.status,
+                  rejectedPayloads.contains(code.payload) else {
+                return cell
             }
-            return cells
+            return GridCell(
+                row: cell.row,
+                col: cell.col,
+                status: .unreadable(
+                    reason: .validatorRejected(decodedPayload: code.payload),
+                    boundingBox: code.boundingBox
+                ),
+                userOverride: cell.userOverride,
+                userAdded: cell.userAdded
+            )
         }
     }
 
-    /// Builds an empty quality report appropriate for the layout.
-    private static func scaffoldQuality(for layout: BoxLayout) -> ScanQualityReport {
+    /// Builds the v1.0 ScanQualityReport. Warnings are intentionally
+    /// empty here — full warning assembly lands with `dms-uff`.
+    private static func buildQualityReport(
+        cells: [GridCell],
+        rejectedCount: Int,
+        outlierCount: Int,
+        layout: BoxLayout
+    ) -> ScanQualityReport {
         let expected: Int?
         switch layout {
         case .auto:
@@ -126,24 +221,25 @@ public actor ScanPipeline {
         case let .fixed(rows, cols):
             expected = rows * cols
         }
+        var decodedCount = 0
+        var minConfidence: Float = .greatestFiniteMagnitude
+        for cell in cells {
+            if case let .decoded(code) = cell.status {
+                decodedCount += 1
+                if code.confidence < minConfidence {
+                    minConfidence = code.confidence
+                }
+            }
+        }
+        let confidenceFloor: Float = decodedCount > 0 ? minConfidence : 0
         return ScanQualityReport(
-            decodedCount: 0,
-            rejectedByValidatorCount: 0,
+            decodedCount: decodedCount,
+            rejectedByValidatorCount: rejectedCount,
             expectedCount: expected,
-            outlierCount: 0,
+            outlierCount: outlierCount,
             principalAxisAngle: 0,
-            confidenceFloor: 0,
+            confidenceFloor: confidenceFloor,
             warnings: []
         )
     }
-}
-
-/// `Sendable` envelope around `UIImage` for the scaffold pipeline.
-///
-/// `UIImage` is reference-typed and not formally `Sendable`. The
-/// scaffold treats the input as immutable for the duration of the run
-/// — no mutation, no draw-into. Bead **dms-5c3.4** will replace this
-/// with a `CGImage` parameter (which IS `Sendable`) at the public API.
-private struct ImageBox: @unchecked Sendable {
-    let image: UIImage
 }
