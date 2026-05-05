@@ -4,7 +4,7 @@ import SwiftUI
 struct DataMatrixScannerApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ScanView()
         }
     }
 }
