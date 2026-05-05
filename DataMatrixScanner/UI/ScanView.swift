@@ -55,7 +55,7 @@ public struct ScanView: View {
             .navigationTitle("Scan")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: ScanViewModel.self) { viewModel in
-                ResultViewPlaceholder(viewModel: viewModel)
+                ResultView(viewModel: viewModel)
             }
             .alert(
                 "Could not load photo",
@@ -107,41 +107,6 @@ public struct ScanView: View {
 private struct LoadError: Identifiable {
     let id = UUID()
     let message: String
-}
-
-/// Temporary destination view. Replaced by the real `ResultView` in
-/// dms-hw2.
-private struct ResultViewPlaceholder: View {
-    @ObservedObject var viewModel: ScanViewModel
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("ResultView placeholder — wired in dms-hw2")
-                .font(.headline)
-                .multilineTextAlignment(.center)
-            if viewModel.isRunning {
-                ProgressView()
-            }
-            Group {
-                Text("stage: \(stageLabel)")
-                Text("cells: \(viewModel.result.map { "\($0.cells.count)" } ?? "—")")
-                if let failure = viewModel.failure {
-                    Text("failure: \(String(describing: failure))")
-                        .foregroundStyle(.red)
-                }
-            }
-            .font(.system(.body, design: .monospaced))
-            Spacer()
-        }
-        .padding()
-        .navigationTitle("Result")
-        .navigationBarTitleDisplayMode(.inline)
-    }
-
-    private var stageLabel: String {
-        guard let stage = viewModel.stage else { return "—" }
-        return String(describing: stage)
-    }
 }
 
 #Preview {
