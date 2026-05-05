@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// Validates decoded Data Matrix payloads against a user-configurable regex.
@@ -34,6 +35,14 @@ public final class PayloadValidator: @unchecked Sendable {
     /// The CEL default validator regex. Matches a single uppercase letter
     /// followed by exactly five digits (e.g. `A00011`).
     public static let celDefaultPattern: String = #"^[A-Z]\d{5}$"#
+
+    /// Decoder confidence floor used by ``revalidate(rawPayloads:)``.
+    ///
+    /// Detections whose `confidence` falls strictly below this threshold are
+    /// surfaced as `CellStatus.unreadable(.lowConfidence(...))` even when the
+    /// payload satisfies the validator regex. The floor matches the
+    /// `payload-validation` spec.
+    public static let confidenceFloor: Float = 0.5
 
     /// `UserDefaults` key under which the active regex pattern is stored.
     /// Shared with the Settings store `@AppStorage` binding via
@@ -80,5 +89,79 @@ public final class PayloadValidator: @unchecked Sendable {
         guard let regex = regex else { return false }
         let range = NSRange(payload.startIndex..<payload.endIndex, in: payload)
         return regex.firstMatch(in: payload, options: [], range: range) != nil
+    }
+
+    /// Re-applies the validator over `rawPayloads` and returns a fresh array
+    /// of `GridCell` values without mutating any input.
+    ///
+    /// This is the pure entry point the derived-cell model relies on: when
+    /// the user changes the regex in Settings, historical scans can be
+    /// re-rendered by feeding their stored raw payloads through this method
+    /// alongside the new validator.
+    ///
+    /// Cells are NOT placed in a grid here — placement is the responsibility
+    /// of `GridInferencer`. The returned cells carry `row = -1`, `col = -1`
+    /// as a "not yet placed" sentinel; callers feed them into the inferencer
+    /// alongside the active layout to receive final `(row, col)` assignments.
+    ///
+    /// Per-payload mapping:
+    /// - `payload == nil` → `.unreadable(.decodeFailed, boundingBox: bbox)`
+    /// - payload matches and `confidence >= confidenceFloor` → `.decoded(...)`
+    /// - payload matches but `confidence < confidenceFloor` →
+    ///   `.unreadable(.lowConfidence(payload:, confidence:), boundingBox:)`
+    /// - payload does not match →
+    ///   `.unreadable(.validatorRejected(decodedPayload:), boundingBox:)`
+    ///
+    /// All returned cells have `userOverride == nil` and `userAdded == false`.
+    /// The original `StoredRawPayload` instances are not mutated.
+    ///
+    /// - Parameter rawPayloads: persisted raw detections from a `StoredScan`.
+    /// - Returns: cells in the same order as `rawPayloads`, each with
+    ///   `(row, col) == (-1, -1)`.
+    public func revalidate(rawPayloads: [StoredRawPayload]) -> [GridCell] {
+        rawPayloads.map { raw in
+            let bbox = CGRect(
+                x: raw.bboxX,
+                y: raw.bboxY,
+                width: raw.bboxWidth,
+                height: raw.bboxHeight
+            )
+            let status: CellStatus
+            if let payload = raw.payload {
+                if matches(payload) {
+                    if raw.confidence < PayloadValidator.confidenceFloor {
+                        status = .unreadable(
+                            reason: .lowConfidence(
+                                payload: payload,
+                                confidence: raw.confidence
+                            ),
+                            boundingBox: bbox
+                        )
+                    } else {
+                        let detected = DetectedCode(
+                            payload: payload,
+                            boundingBox: bbox,
+                            confidence: raw.confidence,
+                            rawBytes: raw.rawBytes
+                        )
+                        status = .decoded(detected)
+                    }
+                } else {
+                    status = .unreadable(
+                        reason: .validatorRejected(decodedPayload: payload),
+                        boundingBox: bbox
+                    )
+                }
+            } else {
+                status = .unreadable(reason: .decodeFailed, boundingBox: bbox)
+            }
+            return GridCell(
+                row: -1,
+                col: -1,
+                status: status,
+                userOverride: nil,
+                userAdded: false
+            )
+        }
     }
 }
