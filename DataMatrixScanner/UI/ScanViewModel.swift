@@ -43,14 +43,21 @@ public final class ScanViewModel: ObservableObject, Identifiable, Hashable {
     @Published public private(set) var isRunning: Bool
 
     private var consumer: Task<Void, Never>?
+    private let storageManager: StorageManager?
 
     /// Creates an idle view-model. Call `run(...)` to start a scan.
-    public init() {
+    ///
+    /// - Parameter storageManager: Optional persistence sink forwarded
+    ///   to the per-run `ScanPipeline`. Defaults to `nil` so callers
+    ///   that don't need persistence (unit tests, previews) keep their
+    ///   existing call sites.
+    public init(storageManager: StorageManager? = nil) {
         self.id = UUID()
         self.stage = nil
         self.result = nil
         self.failure = nil
         self.isRunning = false
+        self.storageManager = storageManager
     }
 
     /// Kicks off a new pipeline run against `cgImage`. Cancels any
@@ -74,8 +81,9 @@ public final class ScanViewModel: ObservableObject, Identifiable, Hashable {
         failure = nil
         isRunning = true
 
+        let storageManager = self.storageManager
         consumer = Task { [weak self] in
-            let pipeline = ScanPipeline()
+            let pipeline = ScanPipeline(storageManager: storageManager)
             let stream = await pipeline.run(
                 cgImage: cgImage,
                 layout: layout,

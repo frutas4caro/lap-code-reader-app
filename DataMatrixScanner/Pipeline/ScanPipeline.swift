@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import os
 import UIKit
 
 /// Orchestrates the scan pipeline: quality analysis → decode → validate →
@@ -12,8 +13,12 @@ import UIKit
 ///   stage is emitted for telemetry only and an empty-but-valid
 ///   `ScanQualityReport` is produced. Real warning assembly lands with
 ///   `dms-uff`.
-/// - `StorageManager` is intentionally skipped (no persistence in v1.0);
-///   `saving` stage is emitted as a no-op label.
+/// - When a `StorageManager` is injected (v1.1+), the `.saving` stage
+///   triggers `StorageManager.save(_:)`. Save failures are logged via
+///   `os.Logger` and SWALLOWED — the pipeline still emits `.complete`
+///   so transient persistence errors never block the user. When no
+///   manager is injected (the v1.0 default and the unit-test default),
+///   `.saving` is emitted as a no-op label, preserving prior behaviour.
 ///
 /// Sendability: the public API takes a `CGImage` (which IS `Sendable`),
 /// so no `@unchecked Sendable` wrapper is required to cross the actor
@@ -25,20 +30,34 @@ public actor ScanPipeline {
     private let inferencer: GridInferencer
     private let annotator: ImageAnnotator
     private let csvExporter: CSVExporter
+    private let storageManager: StorageManager?
+
+    private static let logger = Logger(
+        subsystem: "com.cel.datamatrixscanner",
+        category: "ScanPipeline"
+    )
 
     /// Creates a new pipeline. Service dependencies default to standard
     /// implementations; callers may inject alternatives for testing. This
     /// is the seam where future fakes/spies will land — see dms-ay9.
+    ///
+    /// - Parameter storageManager: Optional persistence sink. When `nil`
+    ///   the `.saving` stage is a no-op (used by v1.0 callers and most
+    ///   unit tests, which don't need a SwiftData container). When set,
+    ///   `.saving` calls `StorageManager.save(_:)`; failures are logged
+    ///   and swallowed.
     public init(
         scanner: BarcodeScanner = BarcodeScanner(),
         inferencer: GridInferencer = GridInferencer(),
         annotator: ImageAnnotator = ImageAnnotator(),
-        csvExporter: CSVExporter = CSVExporter()
+        csvExporter: CSVExporter = CSVExporter(),
+        storageManager: StorageManager? = nil
     ) {
         self.scanner = scanner
         self.inferencer = inferencer
         self.annotator = annotator
         self.csvExporter = csvExporter
+        self.storageManager = storageManager
     }
 
     /// Runs the pipeline against `cgImage` and emits an ordered stream of
@@ -65,6 +84,7 @@ public actor ScanPipeline {
         let inferencer = self.inferencer
         let annotator = self.annotator
         let csvExporter = self.csvExporter
+        let storageManager = self.storageManager
 
         return AsyncStream { continuation in
             let task = Task {
@@ -76,6 +96,7 @@ public actor ScanPipeline {
                     inferencer: inferencer,
                     annotator: annotator,
                     csvExporter: csvExporter,
+                    storageManager: storageManager,
                     continuation: continuation
                 )
             }
@@ -96,6 +117,7 @@ public actor ScanPipeline {
         inferencer: GridInferencer,
         annotator: ImageAnnotator,
         csvExporter: CSVExporter,
+        storageManager: StorageManager?,
         continuation: AsyncStream<PipelineEvent>.Continuation
     ) async {
         // TODO(dms-uff: ImageQualityAnalyzer) — emit stage label only;
@@ -169,8 +191,19 @@ public actor ScanPipeline {
         // for telemetry symmetry.
         continuation.yield(.stage(.exporting))
 
-        // TODO(dms-1ni.5: StorageManager) — no persistence in v1.0.
+        // Persistence (v1.1+). Failures are non-fatal: the user still
+        // sees `.complete` even if the SwiftData write or photo write
+        // throws. Errors are logged via os.Logger for diagnostics.
         continuation.yield(.stage(.saving))
+        if let storage = storageManager {
+            do {
+                _ = try await storage.save(scanResult)
+            } catch {
+                logger.warning(
+                    "StorageManager.save failed (non-fatal): \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
 
         continuation.yield(.complete(scanResult))
         continuation.finish()

@@ -14,6 +14,7 @@ import UIKit
 public struct ScanView: View {
 
     @StateObject private var settings = AppSettings()
+    @Environment(\.storageManager) private var storageManager
     @State private var path: [ScanViewModel] = []
     @State private var selectedItem: PhotosPickerItem?
     @State private var loadError: LoadError?
@@ -73,6 +74,14 @@ public struct ScanView: View {
                 guard let newValue else { return }
                 Task { await handleSelection(newValue) }
             }
+            .task {
+                // Launch-time photo trim. Failures are logged inside
+                // StorageManager, never surfaced — a stale photo cache
+                // is not a user-facing error.
+                if let storage = storageManager {
+                    _ = try? await storage.trim()
+                }
+            }
         }
     }
 
@@ -91,7 +100,7 @@ public struct ScanView: View {
                 loadError = LoadError(message: "Could not extract a CGImage from the selected photo.")
                 return
             }
-            let viewModel = ScanViewModel()
+            let viewModel = ScanViewModel(storageManager: storageManager)
             viewModel.run(
                 cgImage: cgImage,
                 layout: settings.defaultLayout,
