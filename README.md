@@ -46,4 +46,3 @@ Defined in `Color+AppColors.swift` as static extensions on `Color`. All UI code 
 | `.appLightestBlue` | `#e4f1fb` | Controls panel background |
 
 Color assets live in `Assets.xcassets` as named `AppBlue.colorset`, etc., allowing future dark-mode variants to be added without code changes.
-# lap-code-reader-app
